@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import hmac
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -98,11 +99,13 @@ class PendingApproval:
         policy_result: Classification produced before the interrupt was raised.
             Always ``"requires_approval"`` here; included for auditability.
         decision_shape: Which actions the human may take.
-        resume_token: Hex digest that binds an :class:`ApprovalDecision` back
-            to this exact record.  Derived deterministically from
-            ``(thread_id, node_name, tool_name, tool_call_id, args_digest)``
-            so that it is stable across node re-executions (LangGraph replays
-            the node from the top when resuming after an interrupt).
+        resume_token: Hex digest that authorises an :class:`ApprovalDecision`
+            for this exact record.  When the wrapper is created with a
+            ``secret``, this is an HMAC-SHA-256 over the stable call identity
+            (non-forgeable without the secret).  Without a secret it falls back
+            to a plain SHA-256 of the same preimage.  Either way the value is
+            fully deterministic so it reproduces correctly when LangGraph
+            replays the node from the top after resuming from an interrupt.
         terminal_state: Set once the decision has been processed. ``None``
             while still pending.
         approved_args_digest: SHA-256 hex digest of the *edited* args when
@@ -122,8 +125,10 @@ class PendingApproval:
 
     def __post_init__(self) -> None:
         if not self.resume_token:
-            # Derive deterministically so the same token is reproduced when
-            # the node re-runs after the graph resumes from interrupt().
+            # Fallback: plain SHA-256 when no secret was passed at wrapper
+            # construction.  The factory always pre-computes and injects the
+            # token, so this branch is only reached by direct dataclass use
+            # (e.g., tests that construct PendingApproval without a wrapper).
             key = ":".join([
                 self.thread_id, self.node_name, self.tool_name,
                 self.tool_call_id, self.args_digest,
@@ -181,8 +186,31 @@ def _canonical_digest(args: dict) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def _compute_resume_token(
+    thread_id: str,
+    node_name: str,
+    tool_name: str,
+    tool_call_id: str,
+    args_digest: str,
+    secret: str | None,
+) -> str:
+    """Return the resume credential for a pending approval record.
+
+    When *secret* is provided the credential is an HMAC-SHA-256 keyed by the
+    secret — non-forgeable by callers who can reconstruct the stable preimage
+    but do not know the secret.  Without a secret the credential is a plain
+    SHA-256 of the same preimage (deterministic but guessable; suitable for
+    non-adversarial contexts where the interrupt channel itself is access-
+    controlled).
+    """
+    preimage = ":".join([thread_id, node_name, tool_name, tool_call_id, args_digest])
+    if secret:
+        return hmac.new(secret.encode(), preimage.encode(), hashlib.sha256).hexdigest()
+    return hashlib.sha256(preimage.encode()).hexdigest()
+
+
 def _match_patterns(name: str, patterns: list[str]) -> bool:
-    return any(fnmatch.fnmatch(name, p) for p in patterns)
+    return any(fnmatch.fnmatchcase(name, p) for p in patterns)
 
 
 def _classify(
@@ -222,25 +250,30 @@ def _validate_decision(decision: ApprovalDecision, pending: PendingApproval) -> 
     1. ``token`` must equal ``pending.resume_token``.
     2. ``tool_call_id`` must equal ``pending.tool_call_id``.
     3. ``pending.terminal_state`` must be ``None`` (not already resolved).
-    4. When ``action == "edit"``, ``edited_args`` must be non-empty.
+    4. ``action`` must be permitted by ``pending.decision_shape``.
+    5. When ``action == "edit"``, ``edited_args`` must be non-empty.
     """
-    if decision.token != pending.resume_token:
+    if not hmac.compare_digest(decision.token, pending.resume_token):
         raise ValueError(
-            f"Resume token mismatch for tool '{pending.tool_name}': "
-            f"expected '{pending.resume_token}', got '{decision.token}'. "
-            "This decision does not correspond to the pending approval record."
+            f"Resume token mismatch for tool '{pending.tool_name}'. "
+            "The supplied token does not match the pending approval record."
         )
     if decision.tool_call_id != pending.tool_call_id:
         raise ValueError(
-            f"tool_call_id mismatch: expected '{pending.tool_call_id}', "
-            f"got '{decision.tool_call_id}'. A captured approval cannot be "
-            "replayed against a different tool call."
+            f"tool_call_id mismatch for tool '{pending.tool_name}'. "
+            "A captured approval cannot be replayed against a different tool call."
         )
     if pending.terminal_state is not None:
         raise ValueError(
             f"Cannot resume: approval for tool '{pending.tool_name}' "
             f"(tool_call_id='{pending.tool_call_id}') is already in "
             f"terminal state '{pending.terminal_state}'."
+        )
+    if decision.action == "edit" and pending.decision_shape == "approve_or_reject":
+        raise ValueError(
+            f"Action 'edit' is not permitted: the pending approval for tool "
+            f"'{pending.tool_name}' was created with decision_shape="
+            f"'approve_or_reject'."
         )
     if decision.action == "edit" and not decision.edited_args:
         raise ValueError(
@@ -265,13 +298,14 @@ def human_approval(
         "approve_or_reject", "approve_reject_or_edit"
     ] = "approve_reject_or_edit",
     node_name: str = "tools",
+    secret: str | None = None,
 ) -> ToolCallWrapper:
     """Return a :data:`~langgraph.prebuilt.tool_node.ToolCallWrapper` that
     gates tool execution on human approval.
 
     Each incoming tool call is classified against *deny* and *allow* glob
-    patterns (evaluated in that order).  Calls that match neither pattern
-    require an explicit human decision before the tool runs.
+    patterns (evaluated in that order, case-sensitively).  Calls that match
+    neither pattern require an explicit human decision before the tool runs.
 
     Args:
         allow: Glob patterns for tool names that execute automatically without
@@ -283,6 +317,12 @@ def human_approval(
         node_name: Descriptive name of the owning
             :class:`~langgraph.prebuilt.ToolNode`; stored in the
             :class:`PendingApproval` record for audit purposes.
+        secret: Server-side secret used to HMAC-sign the ``resume_token``.
+            When provided, the token is non-forgeable by callers who can
+            reconstruct the stable call identity (thread, node, tool, call-id,
+            args digest).  When omitted the token falls back to a plain
+            SHA-256 of the same preimage — deterministic but guessable if the
+            interrupt channel itself is not access-controlled.
 
     Returns:
         A synchronous :data:`~langgraph.prebuilt.tool_node.ToolCallWrapper`
@@ -290,11 +330,15 @@ def human_approval(
 
     Example::
 
-        wrapper = human_approval(allow=["search_*"], deny=["rm_*"])
+        wrapper = human_approval(
+            allow=["search_*"],
+            deny=["rm_*"],
+            secret=os.environ["APPROVAL_SECRET"],
+        )
         node = ToolNode(tools, wrap_tool_call=wrapper)
     """
-    allow_patterns: list[str] = allow or []
-    deny_patterns: list[str] = deny or []
+    allow_patterns: list[str] = list(allow) if allow else []
+    deny_patterns: list[str] = list(deny) if deny else []
 
     def _wrapper(
         request: ToolCallRequest,
@@ -317,14 +361,20 @@ def human_approval(
             return _denial_message(tool_call_id, tool_name)
 
         # ── requires_approval: create durable record, interrupt ────────────
+        thread_id = _thread_id_from_config(config)
+        args_digest = _canonical_digest(args)
+        resume_token = _compute_resume_token(
+            thread_id, node_name, tool_name, tool_call_id, args_digest, secret
+        )
         pending = PendingApproval(
-            thread_id=_thread_id_from_config(config),
+            thread_id=thread_id,
             node_name=node_name,
             tool_name=tool_name,
             tool_call_id=tool_call_id,
-            args_digest=_canonical_digest(args),
+            args_digest=args_digest,
             policy_result="requires_approval",
             decision_shape=decision_shape,
+            resume_token=resume_token,
         )
 
         # interrupt() raises GraphInterrupt (a GraphBubbleUp); it is
@@ -381,19 +431,25 @@ def async_human_approval(
         "approve_or_reject", "approve_reject_or_edit"
     ] = "approve_reject_or_edit",
     node_name: str = "tools",
+    secret: str | None = None,
 ) -> AsyncToolCallWrapper:
     """Async variant of :func:`human_approval`.
 
     Returns an :data:`~langgraph.prebuilt.tool_node.AsyncToolCallWrapper` for
-    use with async graphs.  Shares identical approval logic.
+    use with async graphs.  Shares identical approval logic, including the
+    optional HMAC ``secret`` parameter.
 
     Example::
 
-        wrapper = async_human_approval(allow=["search_*"], deny=["rm_*"])
+        wrapper = async_human_approval(
+            allow=["search_*"],
+            deny=["rm_*"],
+            secret=os.environ["APPROVAL_SECRET"],
+        )
         node = ToolNode(tools, awrap_tool_call=wrapper)
     """
-    allow_patterns: list[str] = allow or []
-    deny_patterns: list[str] = deny or []
+    allow_patterns: list[str] = list(allow) if allow else []
+    deny_patterns: list[str] = list(deny) if deny else []
 
     async def _awrapper(
         request: ToolCallRequest,
@@ -413,14 +469,20 @@ def async_human_approval(
         if policy == "deny":
             return _denial_message(tool_call_id, tool_name)
 
+        thread_id = _thread_id_from_config(config)
+        args_digest = _canonical_digest(args)
+        resume_token = _compute_resume_token(
+            thread_id, node_name, tool_name, tool_call_id, args_digest, secret
+        )
         pending = PendingApproval(
-            thread_id=_thread_id_from_config(config),
+            thread_id=thread_id,
             node_name=node_name,
             tool_name=tool_name,
             tool_call_id=tool_call_id,
-            args_digest=_canonical_digest(args),
+            args_digest=args_digest,
             policy_result="requires_approval",
             decision_shape=decision_shape,
+            resume_token=resume_token,
         )
 
         raw_decision = interrupt(pending.to_dict())

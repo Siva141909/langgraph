@@ -13,7 +13,6 @@ Pinned cases from PR review (rpelevin):
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from unittest.mock import Mock
 
 import pytest
@@ -24,16 +23,16 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.store.base import BaseStore
-from langgraph.types import Command, Interrupt
+from langgraph.types import Command
 
 from langgraph.prebuilt import ToolNode, human_approval
 from langgraph.prebuilt.human_approval import (
     ApprovalDecision,
     PendingApproval,
     _canonical_digest,
+    _classify,
     _validate_decision,
 )
-from langgraph.prebuilt.tool_node import ToolCallRequest
 
 pytestmark = pytest.mark.anyio
 
@@ -542,3 +541,91 @@ async def test_async_human_approval_deny() -> None:
     tm = result["messages"][0]
     assert tm.status == "error"
     assert "denied by policy" in tm.content
+
+
+# ===========================================================================
+# Regression test 8 — decision_shape blocks edit when only approve/reject allowed
+# ===========================================================================
+
+
+def test_decision_shape_blocks_edit_when_approve_or_reject_only() -> None:
+    """Edit action must be rejected when decision_shape is 'approve_or_reject'."""
+    pending = PendingApproval(
+        thread_id="t1",
+        node_name="tools",
+        tool_name="send_email",
+        tool_call_id="call-8",
+        args_digest=_canonical_digest({"to": "x@y.com", "subject": "s", "body": "b"}),
+        policy_result="requires_approval",
+        decision_shape="approve_or_reject",
+    )
+    decision = ApprovalDecision(
+        token=pending.resume_token,
+        tool_call_id=pending.tool_call_id,
+        action="edit",
+        edited_args={"to": "z@y.com", "subject": "s", "body": "b"},
+    )
+    with pytest.raises(ValueError, match="'edit' is not permitted"):
+        _validate_decision(decision, pending)
+
+    # approve is still allowed for the same pending record.
+    approve_decision = ApprovalDecision(
+        token=pending.resume_token,
+        tool_call_id=pending.tool_call_id,
+        action="approve",
+    )
+    _validate_decision(approve_decision, pending)  # must not raise
+
+
+# ===========================================================================
+# Regression test 9 — policy matching is case-sensitive across platforms
+# ===========================================================================
+
+
+def test_policy_matching_is_case_sensitive() -> None:
+    """Glob patterns must match case-sensitively even on case-insensitive filesystems.
+
+    fnmatch.fnmatch on macOS/Windows may match case-insensitively; we use
+    fnmatch.fnmatchcase to guarantee the same behaviour on all platforms.
+    """
+    # 'Read_*' (capital R) must NOT classify 'read_file' as allowed.
+    assert _classify("read_file", ["Read_*"], []) == "requires_approval"
+    # Correct case must match.
+    assert _classify("read_file", ["read_*"], []) == "allow"
+    # Deny side: 'Delete_*' must NOT classify 'delete_file' as denied.
+    assert _classify("delete_file", [], ["Delete_*"]) == "requires_approval"
+    # Correct case on deny side.
+    assert _classify("delete_file", [], ["delete_*"]) == "deny"
+
+
+# ===========================================================================
+# Regression test 10 — allow/deny lists are copied at wrapper construction
+# ===========================================================================
+
+
+def test_allow_deny_lists_are_copied_at_construction(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """Mutating allow/deny lists after wrapper creation must not change runtime policy."""
+    allow = ["read_*"]
+    deny: list[str] = []
+    wrapper = human_approval(allow=allow, deny=deny)
+
+    # Extend the caller's list to include send_email AFTER wrapper was built.
+    allow.append("send_*")
+
+    # send_email must still require approval, not be auto-allowed.
+    # If the lists were shared (not copied), it would execute without interrupting.
+    graph = _graph_with_wrapper(wrapper, sync_checkpointer, tools=[send_email])
+    config: RunnableConfig = {"configurable": {"thread_id": "thread-copy-test"}}
+
+    graph.invoke(
+        {"messages": [_ai_msg("send_email", {"to": "x", "subject": "y", "body": "z"})]},
+        config=config,
+    )
+
+    state = graph.get_state(config)
+    # Graph is still waiting for human approval — interrupt was raised.
+    assert state.next == ("tools",)
+    assert len(state.tasks[0].interrupts) == 1
+    assert state.tasks[0].interrupts[0].value["tool_name"] == "send_email"
